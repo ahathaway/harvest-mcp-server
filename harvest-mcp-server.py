@@ -20,6 +20,26 @@ if not HARVEST_ACCOUNT_ID or not HARVEST_API_KEY:
 # instead of modifying Harvest data.
 HARVEST_READ_ONLY = os.environ.get("HARVEST_READ_ONLY", "").lower() in ("true", "1", "yes")
 
+# Sending an invoice emails a real client. It is gated separately from the general
+# write flag: the operator must opt in with HARVEST_ALLOW_INVOICE_SEND, and the caller
+# must additionally echo back the invoice number it intends to send.
+HARVEST_ALLOW_INVOICE_SEND = os.environ.get(
+    "HARVEST_ALLOW_INVOICE_SEND", ""
+).lower() in ("true", "1", "yes")
+
+SEND_DISABLED_MESSAGE = json.dumps(
+    {
+        "error": "invoice_send_disabled",
+        "message": (
+            "Sending invoices is disabled. This emails a real client, so it is gated "
+            "separately from other writes. To enable, set HARVEST_ALLOW_INVOICE_SEND=true "
+            "in the server environment and restart. Drafting, updating and state changes "
+            "that do not email anyone are unaffected."
+        ),
+    },
+    indent=2,
+)
+
 READ_ONLY_MESSAGE = json.dumps(
     {
         "error": "read_only_mode",
@@ -101,6 +121,72 @@ async def get_user_details(user_id: int):
 
 
 @mcp.tool()
+async def list_my_project_assignments(
+    user_id: int = None, compact: bool = True, page: int = None, per_page: int = None
+):
+    """List the projects and tasks the authenticated user is assigned to.
+
+    Use this to discover valid project_id / task_id pairs for create_time_entry
+    and start_timer. Unlike list_projects and list_tasks, this endpoint works for
+    non-admin members, so it is the reliable way to enumerate what you can log
+    time against. This is the same data the Harvest web timer's project picker shows.
+
+    Args:
+        user_id: Look up another user's assignments (requires admin). Defaults to the authenticated user.
+        compact: Return only project/client/task ids and names. Set false for full records with rates and budgets.
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000). Defaults to 100.
+    """
+    params = {}
+    if page is not None:
+        params["page"] = str(page)
+    params["per_page"] = str(per_page) if per_page is not None else "100"
+
+    path = (
+        f"users/{user_id}/project_assignments"
+        if user_id is not None
+        else "users/me/project_assignments"
+    )
+    response = await harvest_request(path, params)
+
+    if not compact:
+        return json.dumps(response, indent=2)
+
+    # Full records run ~14 task assignments each with rates and timestamps, which
+    # buries the ids the caller actually needs. Keep the picker-shaped fields only.
+    assignments = [
+        {
+            "project_id": (a.get("project") or {}).get("id"),
+            "project_name": (a.get("project") or {}).get("name"),
+            "is_billable": (a.get("project") or {}).get("is_billable"),
+            "client_name": (a.get("client") or {}).get("name"),
+            "is_project_manager": a.get("is_project_manager"),
+            "tasks": [
+                {
+                    "task_id": (t.get("task") or {}).get("id"),
+                    "task_name": (t.get("task") or {}).get("name"),
+                    "billable": t.get("billable"),
+                }
+                for t in (a.get("task_assignments") or [])
+                if t.get("is_active")
+            ],
+        }
+        for a in response.get("project_assignments", [])
+        if a.get("is_active")
+    ]
+
+    return json.dumps(
+        {
+            "project_assignments": assignments,
+            "page": response.get("page"),
+            "total_pages": response.get("total_pages"),
+            "total_entries": response.get("total_entries"),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
 async def list_time_entries(
     user_id: int = None,
     from_date: str = None,
@@ -134,20 +220,148 @@ async def list_time_entries(
 
 
 @mcp.tool()
+async def get_company():
+    """Retrieve company settings for the authenticated Harvest account.
+
+    Check `wants_timestamp_timers` before creating or updating time entries:
+    when true, Harvest derives duration from started_time/ended_time and ignores
+    the `hours` field entirely.
+    """
+    response = await harvest_request("company")
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def get_time_entry(time_entry_id: int):
+    """Retrieve one time entry by id.
+
+    Useful after a create or update to confirm what Harvest actually stored —
+    accounts configured for timestamp timers can store a different shape than
+    the one requested.
+
+    Args:
+        time_entry_id: The ID of the time entry to retrieve
+    """
+    response = await harvest_request(f"time_entries/{time_entry_id}")
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def update_time_entry(
+    time_entry_id: int,
+    project_id: int = None,
+    task_id: int = None,
+    spent_date: str = None,
+    hours: float = None,
+    started_time: str = None,
+    ended_time: str = None,
+    notes: str | int | None = None,
+):
+    """Update an existing time entry. Only the fields you pass are changed.
+
+    Use this to correct hours, notes, or to move an entry to a different project
+    or task.
+
+    IMPORTANT: on accounts with timestamp timers enabled (company.wants_timestamp_timers
+    is true), Harvest IGNORES `hours` on both create and update — duration is derived
+    from the clock. On those accounts pass started_time and ended_time instead.
+    Check the company setting first if an hours update appears to do nothing.
+
+    Args:
+        time_entry_id: The ID of the time entry to update
+        project_id: Move the entry to this project
+        task_id: Move the entry to this task
+        spent_date: The date the time was spent (YYYY-MM-DD)
+        hours: The number of hours spent. Ignored on timestamp-timer accounts.
+        started_time: Start of the entry, e.g. "8:00am". Timestamp-timer accounts only.
+        ended_time: End of the entry, e.g. "3:30pm". Timestamp-timer accounts only.
+        notes: Notes about the time entry
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    params = {}
+    if project_id is not None:
+        params["project_id"] = project_id
+    if task_id is not None:
+        params["task_id"] = task_id
+    if spent_date is not None:
+        params["spent_date"] = spent_date
+    if hours is not None:
+        params["hours"] = hours
+    if started_time is not None:
+        params["started_time"] = started_time
+    if ended_time is not None:
+        params["ended_time"] = ended_time
+    if notes is not None:
+        params["notes"] = str(notes)
+
+    if not params:
+        return json.dumps(
+            {"error": "no_fields", "message": "Pass at least one field to update."}, indent=2
+        )
+
+    response = await harvest_request(
+        f"time_entries/{time_entry_id}", params, method="PATCH"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def delete_time_entry(time_entry_id: int):
+    """Delete a time entry permanently.
+
+    Args:
+        time_entry_id: The ID of the time entry to delete
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(f"time_entries/{time_entry_id}", method="DELETE")
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def restart_time_entry(time_entry_id: int):
+    """Restart a stopped time entry, making it the running timer again.
+
+    Args:
+        time_entry_id: The ID of the stopped time entry to restart
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"time_entries/{time_entry_id}/restart", method="PATCH"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
 async def create_time_entry(
     project_id: int,
     task_id: int,
     spent_date: str,
-    hours: float,
+    hours: float = None,
+    started_time: str = None,
+    ended_time: str = None,
     notes: str | int | None = None,
 ):
     """Create a new time entry.
+
+    IMPORTANT: on accounts with timestamp timers enabled (company.wants_timestamp_timers
+    is true), Harvest IGNORES `hours` and instead starts a RUNNING TIMER at 0 hours.
+    On those accounts pass started_time and ended_time to log a completed entry.
+    Check the company setting before creating entries in bulk, or you will leave a
+    trail of running timers.
 
     Args:
         project_id: The ID of the project to associate with the time entry
         task_id: The ID of the task to associate with the time entry
         spent_date: The date when the time was spent (YYYY-MM-DD)
-        hours: The number of hours spent
+        hours: The number of hours spent. Ignored on timestamp-timer accounts.
+        started_time: Start of the entry, e.g. "8:00am". Timestamp-timer accounts only.
+        ended_time: End of the entry, e.g. "3:30pm". Timestamp-timer accounts only.
         notes: Optional notes about the time entry
     """
     if HARVEST_READ_ONLY:
@@ -157,9 +371,14 @@ async def create_time_entry(
         "project_id": project_id,
         "task_id": task_id,
         "spent_date": spent_date,
-        "hours": hours,
     }
 
+    if hours is not None:
+        params["hours"] = hours
+    if started_time is not None:
+        params["started_time"] = started_time
+    if ended_time is not None:
+        params["ended_time"] = ended_time
     if notes is not None:
         params["notes"] = str(notes)
 
@@ -1074,6 +1293,774 @@ async def get_unsubmitted_timesheets(
     }
 
     return json.dumps(filtered_response, indent=2)
+
+
+# --- Invoices ------------------------------------------------------------
+#
+# Harvest has no dedicated line-item endpoints: items are created, changed and
+# removed by PATCHing the invoice with a `line_items` array. Deletion is a member
+# carrying `_destroy: true`. The helpers below wrap that so callers never have to
+# hand-build the array.
+#
+# Invoice endpoints require administrator or manager permissions. On an account
+# where the user is a regular member every call here returns "Not authorized!".
+
+
+def _line_items_payload(line_items):
+    """Pass a list of line-item dicts through unchanged, rejecting a bad shape early."""
+    if not isinstance(line_items, list) or not all(
+        isinstance(li, dict) for li in line_items
+    ):
+        raise ValueError("line_items must be a list of objects")
+    return line_items
+
+
+@mcp.tool()
+async def list_invoices(
+    client_id: int = None,
+    project_id: int = None,
+    state: str = None,
+    from_date: str = None,
+    to_date: str = None,
+    updated_since: str = None,
+    page: int = None,
+    per_page: int = None,
+):
+    """List invoices, newest first.
+
+    Args:
+        client_id: Only invoices belonging to this client
+        project_id: Only invoices belonging to this project
+        state: Filter by state: draft, open, paid, or closed
+        from_date: Only invoices with an issue date on or after this date (YYYY-MM-DD)
+        to_date: Only invoices with an issue date on or before this date (YYYY-MM-DD)
+        updated_since: Only invoices updated since this UTC timestamp
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000)
+    """
+    params = {}
+    if client_id is not None:
+        params["client_id"] = str(client_id)
+    if project_id is not None:
+        params["project_id"] = str(project_id)
+    if state is not None:
+        params["state"] = state
+    if from_date is not None:
+        params["from"] = from_date
+    if to_date is not None:
+        params["to"] = to_date
+    if updated_since is not None:
+        params["updated_since"] = updated_since
+    if page is not None:
+        params["page"] = str(page)
+    if per_page is not None:
+        params["per_page"] = str(per_page)
+
+    response = await harvest_request("invoices", params)
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def get_invoice(invoice_id: int):
+    """Retrieve one invoice, including its line items and totals.
+
+    Args:
+        invoice_id: The ID of the invoice to retrieve
+    """
+    response = await harvest_request(f"invoices/{invoice_id}")
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def list_invoice_messages(
+    invoice_id: int,
+    updated_since: str = None,
+    page: int = None,
+    per_page: int = None,
+):
+    """List the messages sent for an invoice, including state-change events.
+
+    Args:
+        invoice_id: The ID of the invoice
+        updated_since: Only messages updated since this UTC timestamp
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000)
+    """
+    params = {}
+    if updated_since is not None:
+        params["updated_since"] = updated_since
+    if page is not None:
+        params["page"] = str(page)
+    if per_page is not None:
+        params["per_page"] = str(per_page)
+
+    response = await harvest_request(f"invoices/{invoice_id}/messages", params)
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def list_invoice_item_categories(
+    updated_since: str = None, page: int = None, per_page: int = None
+):
+    """List invoice item categories, which classify line items.
+
+    Args:
+        updated_since: Only categories updated since this UTC timestamp
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000)
+    """
+    params = {}
+    if updated_since is not None:
+        params["updated_since"] = updated_since
+    if page is not None:
+        params["page"] = str(page)
+    if per_page is not None:
+        params["per_page"] = str(per_page)
+
+    response = await harvest_request("invoice_item_categories", params)
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def get_invoice_item_category(invoice_item_category_id: int):
+    """Retrieve one invoice item category.
+
+    Args:
+        invoice_item_category_id: The ID of the category to retrieve
+    """
+    response = await harvest_request(
+        f"invoice_item_categories/{invoice_item_category_id}"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def create_invoice(
+    client_id: int,
+    line_items: list = None,
+    subject: str = None,
+    notes: str = None,
+    number: str = None,
+    purchase_order: str = None,
+    currency: str = None,
+    issue_date: str = None,
+    due_date: str = None,
+    payment_term: str = None,
+    tax: float = None,
+    tax2: float = None,
+    discount: float = None,
+    estimate_id: int = None,
+    retainer_id: int = None,
+):
+    """Create a free-form invoice. It is created as a DRAFT and is not sent to anyone.
+
+    Args:
+        client_id: The ID of the client this invoice belongs to (required)
+        line_items: List of line-item objects, each with kind, description, unit_price,
+            quantity, and optionally taxed / taxed2 / project_id.
+            Example: [{"kind": "Service", "description": "Consulting",
+            "unit_price": 150, "quantity": 8, "taxed": false}]
+        subject: The invoice subject
+        notes: Notes shown on the invoice
+        number: Invoice number. Harvest assigns the next one when omitted.
+        purchase_order: The client's purchase order number
+        currency: ISO currency code, e.g. USD. Defaults to the client's currency.
+        issue_date: Date the invoice is issued (YYYY-MM-DD). Defaults to today.
+        due_date: Date payment is due (YYYY-MM-DD)
+        payment_term: One of upon receipt, net 15, net 30, net 45, net 60, or custom
+        tax: First tax rate as a percentage
+        tax2: Second tax rate as a percentage
+        discount: Discount as a percentage
+        estimate_id: Associate the invoice with this estimate
+        retainer_id: Associate the invoice with this retainer
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    params = {"client_id": client_id}
+    if line_items is not None:
+        try:
+            params["line_items"] = _line_items_payload(line_items)
+        except ValueError as exc:
+            return json.dumps({"error": "invalid_line_items", "message": str(exc)}, indent=2)
+    for key, value in (
+        ("subject", subject),
+        ("notes", notes),
+        ("number", number),
+        ("purchase_order", purchase_order),
+        ("currency", currency),
+        ("issue_date", issue_date),
+        ("due_date", due_date),
+        ("payment_term", payment_term),
+        ("tax", tax),
+        ("tax2", tax2),
+        ("discount", discount),
+        ("estimate_id", estimate_id),
+        ("retainer_id", retainer_id),
+    ):
+        if value is not None:
+            params[key] = value
+
+    response = await harvest_request("invoices", params, method="POST")
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def update_invoice(
+    invoice_id: int,
+    client_id: int = None,
+    subject: str = None,
+    notes: str = None,
+    number: str = None,
+    purchase_order: str = None,
+    currency: str = None,
+    issue_date: str = None,
+    due_date: str = None,
+    payment_term: str = None,
+    tax: float = None,
+    tax2: float = None,
+    discount: float = None,
+    estimate_id: int = None,
+    retainer_id: int = None,
+):
+    """Update an invoice's own fields. Only the fields you pass are changed.
+
+    Line items are not touched here — use add_invoice_line_items,
+    update_invoice_line_item, or delete_invoice_line_item.
+
+    Args:
+        invoice_id: The ID of the invoice to update
+        client_id: Move the invoice to this client
+        subject: The invoice subject
+        notes: Notes shown on the invoice
+        number: Invoice number
+        purchase_order: The client's purchase order number
+        currency: ISO currency code, e.g. USD
+        issue_date: Date the invoice is issued (YYYY-MM-DD)
+        due_date: Date payment is due (YYYY-MM-DD)
+        payment_term: One of upon receipt, net 15, net 30, net 45, net 60, or custom
+        tax: First tax rate as a percentage
+        tax2: Second tax rate as a percentage
+        discount: Discount as a percentage
+        estimate_id: Associate the invoice with this estimate
+        retainer_id: Associate the invoice with this retainer
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    params = {}
+    for key, value in (
+        ("client_id", client_id),
+        ("subject", subject),
+        ("notes", notes),
+        ("number", number),
+        ("purchase_order", purchase_order),
+        ("currency", currency),
+        ("issue_date", issue_date),
+        ("due_date", due_date),
+        ("payment_term", payment_term),
+        ("tax", tax),
+        ("tax2", tax2),
+        ("discount", discount),
+        ("estimate_id", estimate_id),
+        ("retainer_id", retainer_id),
+    ):
+        if value is not None:
+            params[key] = value
+
+    if not params:
+        return json.dumps(
+            {"error": "no_fields", "message": "Pass at least one field to update."},
+            indent=2,
+        )
+
+    response = await harvest_request(f"invoices/{invoice_id}", params, method="PATCH")
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def add_invoice_line_items(invoice_id: int, line_items: list):
+    """Add one or more line items to an existing invoice.
+
+    Args:
+        invoice_id: The ID of the invoice
+        line_items: List of line-item objects, each with kind, description, unit_price,
+            quantity, and optionally taxed / taxed2 / project_id
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    try:
+        payload = _line_items_payload(line_items)
+    except ValueError as exc:
+        return json.dumps({"error": "invalid_line_items", "message": str(exc)}, indent=2)
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}", {"line_items": payload}, method="PATCH"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def update_invoice_line_item(
+    invoice_id: int,
+    line_item_id: int,
+    kind: str = None,
+    description: str = None,
+    unit_price: float = None,
+    quantity: float = None,
+    taxed: bool = None,
+    taxed2: bool = None,
+    project_id: int = None,
+):
+    """Update one line item on an invoice. Only the fields you pass are changed.
+
+    Args:
+        invoice_id: The ID of the invoice
+        line_item_id: The ID of the line item, from get_invoice
+        kind: The line-item category name, e.g. Service or Product
+        description: Text shown for this line
+        unit_price: Price per unit
+        quantity: Number of units
+        taxed: Whether the first tax rate applies
+        taxed2: Whether the second tax rate applies
+        project_id: Associate this line with a project
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    item = {"id": line_item_id}
+    for key, value in (
+        ("kind", kind),
+        ("description", description),
+        ("unit_price", unit_price),
+        ("quantity", quantity),
+        ("taxed", taxed),
+        ("taxed2", taxed2),
+        ("project_id", project_id),
+    ):
+        if value is not None:
+            item[key] = value
+
+    if len(item) == 1:
+        return json.dumps(
+            {"error": "no_fields", "message": "Pass at least one field to update."},
+            indent=2,
+        )
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}", {"line_items": [item]}, method="PATCH"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def delete_invoice_line_item(invoice_id: int, line_item_id: int):
+    """Remove one line item from an invoice.
+
+    Args:
+        invoice_id: The ID of the invoice
+        line_item_id: The ID of the line item to remove, from get_invoice
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}",
+        {"line_items": [{"id": line_item_id, "_destroy": True}]},
+        method="PATCH",
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def delete_invoice(invoice_id: int):
+    """Delete an invoice permanently. Only draft and open invoices can be deleted.
+
+    Args:
+        invoice_id: The ID of the invoice to delete
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(f"invoices/{invoice_id}", method="DELETE")
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def mark_invoice_closed(invoice_id: int):
+    """Mark an open invoice as closed, e.g. written off. Emails no one.
+
+    The invoice must currently be open; Harvest returns 422 otherwise.
+
+    Args:
+        invoice_id: The ID of the invoice to close
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}/messages", {"event_type": "close"}, method="POST"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def reopen_invoice(invoice_id: int):
+    """Re-open a closed invoice. Emails no one.
+
+    The invoice must currently be closed; Harvest returns 422 otherwise.
+
+    Args:
+        invoice_id: The ID of the invoice to re-open
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}/messages", {"event_type": "re-open"}, method="POST"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def mark_invoice_draft(invoice_id: int):
+    """Return an open invoice to draft state. Emails no one.
+
+    The invoice must currently be open; calling this on a draft returns 422
+    ("Event type can't be draft unless invoice is open").
+
+    Args:
+        invoice_id: The ID of the invoice to return to draft
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}/messages", {"event_type": "draft"}, method="POST"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def send_invoice(invoice_id: int, confirm_invoice_number: str):
+    """SEND an invoice to its client by email, marking a draft invoice as sent.
+
+    THIS EMAILS A REAL CLIENT and cannot be undone. It is gated twice:
+      1. The server must run with HARVEST_ALLOW_INVOICE_SEND=true.
+      2. confirm_invoice_number must match the invoice's actual number, which this
+         tool re-reads from Harvest before sending.
+    Confirm with the user which invoice is going out before calling this.
+
+    Args:
+        invoice_id: The ID of the invoice to send
+        confirm_invoice_number: The invoice's number, echoed back as confirmation
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    if not HARVEST_ALLOW_INVOICE_SEND:
+        return SEND_DISABLED_MESSAGE
+
+    invoice = await harvest_request(f"invoices/{invoice_id}")
+    actual_number = str(invoice.get("number") or "")
+
+    if str(confirm_invoice_number).strip() != actual_number:
+        return json.dumps(
+            {
+                "error": "confirmation_mismatch",
+                "message": (
+                    "Not sending. The confirmation did not match this invoice's number. "
+                    "Re-read the invoice and confirm with the user which one to send."
+                ),
+                "invoice_id": invoice_id,
+                "expected_number": actual_number,
+                "received": str(confirm_invoice_number),
+                "client": (invoice.get("client") or {}).get("name"),
+                "amount": invoice.get("amount"),
+            },
+            indent=2,
+        )
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}/messages", {"event_type": "send"}, method="POST"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def create_invoice_message(
+    invoice_id: int,
+    recipients: list,
+    confirm_invoice_number: str,
+    subject: str = None,
+    body: str = None,
+    include_link_to_client_invoice: bool = None,
+    attach_pdf: bool = None,
+    send_me_a_copy: bool = None,
+    thank_you: bool = None,
+):
+    """EMAIL a message about an invoice to named recipients, e.g. a payment reminder.
+
+    THIS SENDS REAL EMAIL and cannot be undone. Gated identically to send_invoice:
+    HARVEST_ALLOW_INVOICE_SEND must be true, and confirm_invoice_number must match
+    the invoice's actual number.
+
+    Args:
+        invoice_id: The ID of the invoice
+        recipients: List of recipient objects, each with email and optionally name.
+            Example: [{"name": "Gary C.", "email": "gary@example.com"}]
+        confirm_invoice_number: The invoice's number, echoed back as confirmation
+        subject: Subject line of the email
+        body: Body of the email
+        include_link_to_client_invoice: Include a link to the client-facing invoice
+        attach_pdf: Attach the invoice as a PDF
+        send_me_a_copy: Send a copy to the authenticated user
+        thank_you: Mark this message as a thank-you note
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    if not HARVEST_ALLOW_INVOICE_SEND:
+        return SEND_DISABLED_MESSAGE
+
+    if not isinstance(recipients, list) or not recipients:
+        return json.dumps(
+            {"error": "invalid_recipients", "message": "recipients must be a non-empty list"},
+            indent=2,
+        )
+
+    invoice = await harvest_request(f"invoices/{invoice_id}")
+    actual_number = str(invoice.get("number") or "")
+
+    if str(confirm_invoice_number).strip() != actual_number:
+        return json.dumps(
+            {
+                "error": "confirmation_mismatch",
+                "message": "Not sending. The confirmation did not match this invoice's number.",
+                "invoice_id": invoice_id,
+                "expected_number": actual_number,
+                "received": str(confirm_invoice_number),
+            },
+            indent=2,
+        )
+
+    params = {"recipients": recipients}
+    for key, value in (
+        ("subject", subject),
+        ("body", body),
+        ("include_link_to_client_invoice", include_link_to_client_invoice),
+        ("attach_pdf", attach_pdf),
+        ("send_me_a_copy", send_me_a_copy),
+        ("thank_you", thank_you),
+    ):
+        if value is not None:
+            params[key] = value
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}/messages", params, method="POST"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def delete_invoice_message(invoice_id: int, message_id: int):
+    """Delete an invoice message record. Does not un-send an email already delivered.
+
+    Args:
+        invoice_id: The ID of the invoice
+        message_id: The ID of the message to delete
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"invoices/{invoice_id}/messages/{message_id}", method="DELETE"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def create_invoice_item_category(name: str):
+    """Create an invoice item category.
+
+    Args:
+        name: The name of the category, e.g. Service or Product
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        "invoice_item_categories", {"name": name}, method="POST"
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def update_invoice_item_category(invoice_item_category_id: int, name: str):
+    """Rename an invoice item category.
+
+    Args:
+        invoice_item_category_id: The ID of the category to update
+        name: The new name
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"invoice_item_categories/{invoice_item_category_id}",
+        {"name": name},
+        method="PATCH",
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def delete_invoice_item_category(invoice_item_category_id: int):
+    """Delete an invoice item category.
+
+    Args:
+        invoice_item_category_id: The ID of the category to delete
+    """
+    if HARVEST_READ_ONLY:
+        return READ_ONLY_MESSAGE
+
+    response = await harvest_request(
+        f"invoice_item_categories/{invoice_item_category_id}", method="DELETE"
+    )
+    return json.dumps(response, indent=2)
+
+
+# --- Reports -------------------------------------------------------------
+#
+# Harvest exposes ten report endpoints that differ only by grouping, so they are
+# folded into four tools rather than ten near-identical ones. Reports aggregate
+# server-side: one call answers "hours by project last month" without paging
+# thousands of time entries.
+
+TIME_REPORT_GROUPS = ("clients", "projects", "tasks", "team")
+EXPENSE_REPORT_GROUPS = ("clients", "projects", "categories", "team")
+
+
+def _report_params(from_date, to_date, page, per_page):
+    params = {"from": from_date, "to": to_date}
+    if page is not None:
+        params["page"] = str(page)
+    if per_page is not None:
+        params["per_page"] = str(per_page)
+    return params
+
+
+@mcp.tool()
+async def get_time_report(
+    group_by: str,
+    from_date: str,
+    to_date: str,
+    page: int = None,
+    per_page: int = None,
+):
+    """Summarize tracked hours over a date range, grouped by client, project, task, or team member.
+
+    Returns totals per group (total_hours, billable_hours, billable_amount, currency)
+    rather than individual entries. Prefer this over list_time_entries for any
+    "how many hours on X" question — it aggregates server-side.
+
+    Args:
+        group_by: One of clients, projects, tasks, team
+        from_date: Start of the range, inclusive (YYYY-MM-DD or YYYYMMDD)
+        to_date: End of the range, inclusive (YYYY-MM-DD or YYYYMMDD)
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000)
+    """
+    if group_by not in TIME_REPORT_GROUPS:
+        return json.dumps(
+            {"error": "invalid_group_by", "valid_values": list(TIME_REPORT_GROUPS)}, indent=2
+        )
+
+    response = await harvest_request(
+        f"reports/time/{group_by}", _report_params(from_date, to_date, page, per_page)
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def get_expense_report(
+    group_by: str,
+    from_date: str,
+    to_date: str,
+    page: int = None,
+    per_page: int = None,
+):
+    """Summarize expenses over a date range, grouped by client, project, category, or team member.
+
+    Requires administrator or manager permissions; regular members get
+    "Not authorized!" from the Harvest API.
+
+    Args:
+        group_by: One of clients, projects, categories, team
+        from_date: Start of the range, inclusive (YYYY-MM-DD or YYYYMMDD)
+        to_date: End of the range, inclusive (YYYY-MM-DD or YYYYMMDD)
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000)
+    """
+    if group_by not in EXPENSE_REPORT_GROUPS:
+        return json.dumps(
+            {"error": "invalid_group_by", "valid_values": list(EXPENSE_REPORT_GROUPS)}, indent=2
+        )
+
+    response = await harvest_request(
+        f"reports/expenses/{group_by}", _report_params(from_date, to_date, page, per_page)
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def get_uninvoiced_report(
+    from_date: str,
+    to_date: str,
+    page: int = None,
+    per_page: int = None,
+):
+    """Report uninvoiced hours and expenses per project over a date range.
+
+    Shows what has been tracked but not yet billed. Requires administrator or
+    manager permissions.
+
+    Args:
+        from_date: Start of the range, inclusive (YYYY-MM-DD or YYYYMMDD)
+        to_date: End of the range, inclusive (YYYY-MM-DD or YYYYMMDD)
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000)
+    """
+    response = await harvest_request(
+        "reports/uninvoiced", _report_params(from_date, to_date, page, per_page)
+    )
+    return json.dumps(response, indent=2)
+
+
+@mcp.tool()
+async def get_project_budget_report(
+    is_active: bool = None, page: int = None, per_page: int = None
+):
+    """Report budget and budget-spent per project.
+
+    Takes no date range — budgets are reported against the project's own period.
+
+    Args:
+        is_active: Pass true for active projects only, false for inactive
+        page: The page number for pagination
+        per_page: The number of records to return per page (1-2000)
+    """
+    params = {}
+    if is_active is not None:
+        params["is_active"] = "true" if is_active else "false"
+    if page is not None:
+        params["page"] = str(page)
+    if per_page is not None:
+        params["per_page"] = str(per_page)
+
+    response = await harvest_request("reports/project_budget", params)
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool()
